@@ -1,0 +1,57 @@
+# Settings for the dual-supplicant tests.
+#
+# 1. Copy this file to "dsup.ini" and edit it.
+# 2. Anything set here can be overridden by an environment variable
+#    (DSUP_<NAME>, for example DSUP_DEVICE) or by a pytest option
+#    (--dsup-<name>, for example --dsup-device). Order of priority:
+#      command line  >  environment variable  >  this file  >  built-in default
+#
+
+[dsup]
+
+# ---- the board (device under test) -------------------------------------------
+# Address of the board. Required.
+device = 192.168.1.2
+# Login name on the board. The tests restart services, so this must be root
+# (or a user that may run systemctl, nmcli and busctl without a password prompt).
+user = root
+# Optional: any other ssh options.
+# Examples:  -p 2222     -i ~/.ssh/board_key     -o ProxyCommand="ssh -W %h:%p gw"
+#ssh_options =
+# Seconds to wait when connecting.
+#ssh_connect_timeout = 30
+
+# ---- HaLow radio (s1g): wpa_supplicant_s1g -----------------------------------
+#s1g_device = wlan0
+# Access point the tests connect this radio to. Required.
+# The tests make a temporary connection for it and remove it when they finish.
+#s1g_ssid = MyHaLowNetwork
+#s1g_key = my-halow-password
+# Security type and "protected management frames" (PMF) setting of that connection.
+# nmcli values: key mgmt = sae (WPA3) or wpa-psk (WPA2); pmf = 0 default, 1 disable, 2 optional, 3 required
+#s1g_key_mgmt = sae
+#s1g_pmf = 3
+# Only if the automatic detection is wrong:
+#s1g_connection =
+#s1g_gateway =
+
+# ---- standard radio: wpa_supplicant ------------------------------------------
+#std_device = wlan1
+#std_ssid = MyWiFiNetwork
+#std_key = my-wifi-password
+#std_key_mgmt = sae
+#std_pmf = 3
+#std_connection =
+#std_gateway =
+
+# ---- timing ------------------------------------------------------------------
+# Seconds to wait for a radio to be connected again after the tests disturbed it.
+#connect_timeout = 90
+# Customer limit: seconds from wpa_supplicant_s1g owning its name again until wlan0 is up.
+#recovery_limit = 15
+
+# ---- tests about the build (skipped when left unset) ----------------
+# Yocto build directory (for the compile log, the unit-test binaries and the hostap work tree).
+#build_dir = /path/to/build_x11
+# Yocto downloads directory (NetworkManager tarballs are looked up here first).
+#dl_dir = /path/to/downloads
