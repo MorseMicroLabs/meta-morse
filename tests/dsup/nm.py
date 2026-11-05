@@ -101,7 +101,16 @@ def provision(board, r):
         raise RuntimeError(f"could not create the connection for {r.ssid} on {r.dev}: {res.err.strip() or res.out.strip()}")
     r.provisioned = True
     r.conn = r.profile
-    board.run(f"nmcli connection up {r.profile} ifname {r.dev}", timeout=120)
+    hint = (f"Check the SSID, the key and the security settings (key_mgmt {r.key_mgmt or 'none'}, "
+            f"pmf {r.pmf or 'default'}) and that the access point is in range.")
+    up = board.run(f"nmcli connection up {r.profile} ifname {r.dev}", timeout=180)
+    if not up.ok:
+        raise RuntimeError(f"{r.dev} could not connect to '{r.ssid}': {(up.err or up.out).strip()}\n  {hint}")
+    # NetworkManager may fall back to another connection for the same network: the tests must run on this one
+    now = active_connection(board, r.dev)
+    if now != r.profile:
+        raise RuntimeError(f"{r.dev} is connected through '{now or 'nothing'}', not through the connection made "
+                           f"for '{r.ssid}'.\n  {hint}")
 
 
 def deprovision(board, r):
