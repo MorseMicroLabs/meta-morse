@@ -82,6 +82,18 @@ class Board:
         if p.returncode != 0:
             raise RuntimeError(f"could not copy {local} to the board: {p.stderr.decode(errors='replace').strip()}")
 
+    def put_dir(self, local_dir, remote_dir):
+        """Copy the contents of a local directory into <remote_dir> (created if needed) with tar."""
+        q = shlex.quote(remote_dir)
+        tar = subprocess.run(["tar", "-C", str(local_dir), "-cf", "-", "."], stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, timeout=120)
+        if tar.returncode != 0:
+            raise RuntimeError(f"could not pack {local_dir}: {tar.stderr.decode(errors='replace').strip()}")
+        argv = self.ssh_args() + [self.s.target, f"mkdir -p {q} && tar -C {q} -xf -"]
+        p = subprocess.run(argv, input=tar.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+        if p.returncode != 0:
+            raise RuntimeError(f"could not copy {local_dir} to the board: {p.stderr.decode(errors='replace').strip()}")
+
     def get_text(self, remote):
         return self.run(f"cat {shlex.quote(remote)} 2>/dev/null").out
 
