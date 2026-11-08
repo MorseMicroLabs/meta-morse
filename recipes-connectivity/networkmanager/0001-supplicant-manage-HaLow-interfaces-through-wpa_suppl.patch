@@ -1,0 +1,1807 @@
+From f68e90b01b856c30c5c2691950ff1eaf24e103d4 Mon Sep 17 00:00:00 2001
+From: Arien Judge <arien.judge@morsemicro.com>
+Date: Sun, 8 Nov 2026 10:07:02 +1100
+Subject: [PATCH] supplicant: manage HaLow interfaces through
+ wpa_supplicant_s1g
+
+Morse Micro HaLow are handled by wpa_supplicant_s1g. As a modified
+wpa_supplicant, it can be configured such that its DBus name,
+object path and interface prefix are distinct to the standard
+wpa_supplicant allowing the use of the standard supplicant for non-s1g
+alongside the Morse Micro supplicant for Wi-Fi HaLow.
+NetworkManager expects only one supplicant, so needs further modification
+to communicate concurrently with regular Wi-Fi and HaLow radios.
+
+All NMSupplicantManager per-supplicant state (name owner, capabilities,
+D-Bus subscriptions) are moved into a new SupplInst, so that existing
+implementation functions against either supplicant. NMSupplicantManager
+holds two SupplInst, one for wpa_supplicant and one for wpa_supplicant_s1g.
+
+Interface creation picks the instance when the request is made based on
+the driver name. When /sys/class/net/<ifname>/device/driver points at a
+"morse" the interface is directed to wpa_supplicant_s1g.
+
+nm_supplicant_manager_is_available() reports available if either
+supplicant is up.
+
+nm_supplicant_manager_set_wfd_ies() sets WFDIEs on every running
+supplicant.
+
+After creation actions are determined by the DBus path. This therefore
+asserts that the wpa_supplicant_s1g used for "morse" drivers must be
+available on a /fi/w1/wpa_supplicant_s1g path.
+
+NMSupplicantInterface caches the name owner and capabilities from the
+object path at construction. For all subsequent DBus calls, signals, properties
+and errors it determines if it needs to use an S1G variant or standard.
+
+Based-on-patch-by: Chetan Mistry <chetan.mistry@morsemicro.com>
+Signed-off-by: Arien Judge <arien.judge@morsemicro.com>
+---
+ src/core/supplicant/nm-supplicant-interface.c | 137 ++--
+ src/core/supplicant/nm-supplicant-manager.c   | 628 +++++++++++-------
+ src/core/supplicant/nm-supplicant-manager.h   |   6 +-
+ src/core/supplicant/nm-supplicant-types.h     |  25 +-
+ 4 files changed, 500 insertions(+), 296 deletions(-)
+
+diff --git a/src/core/supplicant/nm-supplicant-interface.c b/src/core/supplicant/nm-supplicant-interface.c
+index eb7a40a5..ca9df3a7 100644
+--- a/src/core/supplicant/nm-supplicant-interface.c
++++ b/src/core/supplicant/nm-supplicant-interface.c
+@@ -90,6 +90,8 @@ typedef struct _NMSupplicantInterfacePrivate {
+     NMRefString     *name_owner;
+     NMRefString     *object_path;
+ 
++    bool is_s1g;
++
+     char *ifname;
+ 
+     GCancellable *main_cancellable;
+@@ -191,6 +193,10 @@ _log_pretty_object_path(NMSupplicantInterfacePrivate *priv)
+         s += NM_STRLEN("/fi/w1/wpa_supplicant1/Interfaces/");
+         if (s[0] && s[0] != '/')
+             return s;
++    } else if (NM_STR_HAS_PREFIX(s, "/fi/w1/wpa_supplicant1_s1g/Interfaces/")) {
++        s += NM_STRLEN("/fi/w1/wpa_supplicant1_s1g/Interfaces/");
++        if (s[0] && s[0] != '/')
++            return s;
+     }
+     return priv->object_path->str;
+ }
+@@ -394,7 +400,9 @@ _dbus_connection_call_simple_cb(GObject *source, GAsyncResult *result, gpointer
+ 
+     if (!suppress_warning) {
+         remote_error = g_dbus_error_get_remote_error(error);
+-        if (!nm_streq0(remote_error, "fi.w1.wpa_supplicant1.NotConnected")) {
++        if (!NM_IN_STRSET(remote_error,
++                          "fi.w1.wpa_supplicant1.NotConnected",
++                          "fi.w1.wpa_supplicant1_s1g.NotConnected")) {
+             g_dbus_error_strip_remote_error(error);
+             _LOGW("call-%s: failed with %s", log_reason, error->message);
+             return;
+@@ -486,7 +494,7 @@ _remove_network(NMSupplicantInterface *self)
+ 
+     net_path = g_steal_pointer(&priv->net_path);
+     _dbus_connection_call_simple(self,
+-                                 NM_WPAS_DBUS_IFACE_INTERFACE,
++                                 priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE,
+                                  "RemoveNetwork",
+                                  g_variant_new("(o)", net_path),
+                                  G_VARIANT_TYPE("()"),
+@@ -497,7 +505,7 @@ _remove_network(NMSupplicantInterface *self)
+                                      DBUS_INTERFACE_PROPERTIES,
+                                      "Set",
+                                      g_variant_new("(ssv)",
+-                                                   NM_WPAS_DBUS_IFACE_INTERFACE,
++                                                   priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE,
+                                                    "ApIsolate",
+                                                    g_variant_new_string("0")),
+                                      G_VARIANT_TYPE("()"),
+@@ -850,7 +858,7 @@ _bss_info_add(NMSupplicantInterface *self, const char *object_path)
+     nm_dbus_connection_call_get_all(priv->dbus_connection,
+                                     priv->name_owner->str,
+                                     bss_info->bss_path->str,
+-                                    NM_WPAS_DBUS_IFACE_BSS,
++                                    priv->is_s1g ? NM_WPAS_DBUS_IFACE_BSS_S1G : NM_WPAS_DBUS_IFACE_BSS,
+                                     5000,
+                                     bss_info->_init_cancellable,
+                                     _bss_info_get_all_cb,
+@@ -1048,7 +1056,7 @@ _peer_info_add(NMSupplicantInterface *self, const char *object_path)
+     nm_dbus_connection_call_get_all(priv->dbus_connection,
+                                     priv->name_owner->str,
+                                     peer_info->peer_path->str,
+-                                    NM_WPAS_DBUS_IFACE_PEER,
++                                    priv->is_s1g ? NM_WPAS_DBUS_IFACE_PEER_S1G : NM_WPAS_DBUS_IFACE_PEER,
+                                     5000,
+                                     peer_info->_init_cancellable,
+                                     _peer_info_get_all_cb,
+@@ -1358,7 +1366,7 @@ _starting_check_ready(NMSupplicantInterface *self)
+         nm_dbus_connection_call_set(priv->dbus_connection,
+                                     priv->name_owner->str,
+                                     priv->object_path->str,
+-                                    NM_WPAS_DBUS_IFACE_INTERFACE,
++                                    priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE,
+                                     "SaePwe",
+                                     g_variant_new_string("2"),
+                                     DBUS_TIMEOUT_MSEC,
+@@ -1484,7 +1492,7 @@ nm_supplicant_interface_set_bridge(NMSupplicantInterface *self, const char *brid
+     nm_dbus_connection_call_set(priv->dbus_connection,
+                                 priv->name_owner->str,
+                                 priv->object_path->str,
+-                                NM_WPAS_DBUS_IFACE_INTERFACE,
++                                priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE,
+                                 "BridgeIfname",
+                                 g_variant_new_string(bridge ?: ""),
+                                 DBUS_TIMEOUT_MSEC,
+@@ -1599,14 +1607,14 @@ _p2p_group_set_path(NMSupplicantInterface *self, const char *path)
+             nm_dbus_connection_signal_subscribe_properties_changed(priv->dbus_connection,
+                                                                    priv->name_owner->str,
+                                                                    priv->p2p_group_path->str,
+-                                                                   NM_WPAS_DBUS_IFACE_GROUP,
++                                                                   priv->is_s1g ? NM_WPAS_DBUS_IFACE_GROUP_S1G : NM_WPAS_DBUS_IFACE_GROUP,
+                                                                    _p2p_group_properties_changed_cb,
+                                                                    self,
+                                                                    NULL);
+         nm_dbus_connection_call_get_all(priv->dbus_connection,
+                                         priv->name_owner->str,
+                                         priv->p2p_group_path->str,
+-                                        NM_WPAS_DBUS_IFACE_GROUP,
++                                        priv->is_s1g ? NM_WPAS_DBUS_IFACE_GROUP_S1G : NM_WPAS_DBUS_IFACE_GROUP,
+                                         5000,
+                                         priv->p2p_group_properties_cancellable,
+                                         _p2p_group_properties_get_all_cb,
+@@ -1702,7 +1710,7 @@ _wps_handle_set_pc_cb(GVariant *res, GError *error, gpointer user_data)
+ 
+     wps_data->signal_id = g_dbus_connection_signal_subscribe(priv->dbus_connection,
+                                                              priv->name_owner->str,
+-                                                             NM_WPAS_DBUS_IFACE_INTERFACE_WPS,
++                                                             priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_WPS_S1G : NM_WPAS_DBUS_IFACE_INTERFACE_WPS,
+                                                              "Credentials",
+                                                              priv->object_path->str,
+                                                              NULL,
+@@ -1732,7 +1740,8 @@ _wps_handle_set_pc_cb(GVariant *res, GError *error, gpointer user_data)
+         wps_data->cancellable = g_cancellable_new();
+ 
+     _dbus_connection_call(self,
+-                          NM_WPAS_DBUS_IFACE_INTERFACE_WPS,
++                          priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_WPS_S1G
++                                       : NM_WPAS_DBUS_IFACE_INTERFACE_WPS,
+                           "Start",
+                           g_variant_new("(a{sv})", &start_args),
+                           G_VARIANT_TYPE("(a{sv})"),
+@@ -1754,7 +1763,7 @@ _wps_call_set_pc(NMSupplicantInterface *self, WpsData *wps_data)
+     nm_dbus_connection_call_set(priv->dbus_connection,
+                                 priv->name_owner->str,
+                                 priv->object_path->str,
+-                                NM_WPAS_DBUS_IFACE_INTERFACE_WPS,
++                                priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_WPS_S1G : NM_WPAS_DBUS_IFACE_INTERFACE_WPS,
+                                 "ProcessCredentials",
+                                 g_variant_new_boolean(TRUE),
+                                 5000,
+@@ -1861,7 +1870,7 @@ _wps_start(NMSupplicantInterface *self, const char *type, const char *bssid, con
+         nm_clear_g_dbus_connection_signal(priv->dbus_connection, &wps_data->signal_id);
+ 
+         _dbus_connection_call(self,
+-                              NM_WPAS_DBUS_IFACE_INTERFACE_WPS,
++                              priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_WPS_S1G : NM_WPAS_DBUS_IFACE_INTERFACE_WPS,
+                               "Cancel",
+                               NULL,
+                               G_VARIANT_TYPE("()"),
+@@ -2146,7 +2155,7 @@ nm_supplicant_interface_disconnect(NMSupplicantInterface *self)
+     if ((priv->state >= NM_SUPPLICANT_INTERFACE_STATE_SCANNING)
+         && (priv->state <= NM_SUPPLICANT_INTERFACE_STATE_COMPLETED)) {
+         _dbus_connection_call_simple(self,
+-                                     NM_WPAS_DBUS_IFACE_INTERFACE,
++                                     priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE,
+                                      "Disconnect",
+                                      NULL,
+                                      G_VARIANT_TYPE("()"),
+@@ -2194,11 +2203,14 @@ nm_supplicant_interface_disconnect_async(NMSupplicantInterface            *self,
+                                          NMSupplicantInterfaceDisconnectCb callback,
+                                          gpointer                          user_data)
+ {
++    NMSupplicantInterfacePrivate *priv;
+     g_return_if_fail(NM_IS_SUPPLICANT_INTERFACE(self));
+     g_return_if_fail(callback);
+ 
++    priv = NM_SUPPLICANT_INTERFACE_GET_PRIVATE(self);
++
+     _dbus_connection_call(self,
+-                          NM_WPAS_DBUS_IFACE_INTERFACE,
++                          priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE,
+                           "Disconnect",
+                           NULL,
+                           G_VARIANT_TYPE("()"),
+@@ -2233,7 +2245,7 @@ assoc_call_select_network(NMSupplicantInterface *self)
+     NMSupplicantInterfacePrivate *priv = NM_SUPPLICANT_INTERFACE_GET_PRIVATE(self);
+ 
+     _dbus_connection_call(self,
+-                          NM_WPAS_DBUS_IFACE_INTERFACE,
++                          priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE,
+                           "SelectNetwork",
+                           g_variant_new("(o)", priv->net_path),
+                           G_VARIANT_TYPE("()"),
+@@ -2287,6 +2299,7 @@ assoc_add_network_cb(GObject *source, GAsyncResult *result, gpointer user_data)
+     GBytes                         *blob_data;
+     nm_auto_ref_string NMRefString *name_owner  = NULL;
+     nm_auto_ref_string NMRefString *object_path = NULL;
++    bool is_s1g;
+ 
+     g_clear_object(&add_network_data->shutdown_wait_obj);
+ 
+@@ -2299,6 +2312,8 @@ assoc_add_network_cb(GObject *source, GAsyncResult *result, gpointer user_data)
+ 
+     res = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), result, &error);
+ 
++    is_s1g = nm_supplicant_path_is_s1g(object_path->str);
++
+     if (!assoc_data) {
+         if (!error) {
+             const char *net_path;
+@@ -2312,7 +2327,7 @@ assoc_add_network_cb(GObject *source, GAsyncResult *result, gpointer user_data)
+             g_dbus_connection_call(G_DBUS_CONNECTION(source),
+                                    name_owner->str,
+                                    object_path->str,
+-                                   NM_WPAS_DBUS_IFACE_INTERFACE,
++                                   is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE,
+                                    "RemoveNetwork",
+                                    g_variant_new("(o)", net_path),
+                                    G_VARIANT_TYPE("()"),
+@@ -2354,7 +2369,7 @@ assoc_add_network_cb(GObject *source, GAsyncResult *result, gpointer user_data)
+     while (g_hash_table_iter_next(&iter, (gpointer) &blob_name, (gpointer) &blob_data)) {
+         _dbus_connection_call(
+             self,
+-            NM_WPAS_DBUS_IFACE_INTERFACE,
++            is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE,
+             "AddBlob",
+             g_variant_new("(s@ay)", blob_name, nm_g_bytes_to_variant_ay(blob_data)),
+             G_VARIANT_TYPE("()"),
+@@ -2393,7 +2408,7 @@ add_network(NMSupplicantInterface *self)
+ 
+     _dbus_connection_call(
+         self,
+-        NM_WPAS_DBUS_IFACE_INTERFACE,
++        priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE,
+         "AddNetwork",
+         g_variant_new("(@a{sv})", nm_supplicant_config_to_variant(priv->assoc_data->cfg)),
+         G_VARIANT_TYPE("(o)"),
+@@ -2561,7 +2576,7 @@ nm_supplicant_interface_assoc(NMSupplicantInterface       *self,
+         priv->dbus_connection,
+         priv->name_owner->str,
+         priv->object_path->str,
+-        NM_WPAS_DBUS_IFACE_INTERFACE,
++        priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE,
+         "ApScan",
+         g_variant_new_uint32(nm_supplicant_config_get_ap_scan(priv->assoc_data->cfg)),
+         DBUS_TIMEOUT_MSEC,
+@@ -2576,7 +2591,7 @@ nm_supplicant_interface_assoc(NMSupplicantInterface       *self,
+     nm_dbus_connection_call_set(priv->dbus_connection,
+                                 priv->name_owner->str,
+                                 priv->object_path->str,
+-                                NM_WPAS_DBUS_IFACE_INTERFACE,
++                                priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE,
+                                 "Dot11RSNAConfigPMKLifetime",
+                                 g_variant_new_take_string(g_strdup_printf("%u", PMK_LIFETIME_SEC)),
+                                 DBUS_TIMEOUT_MSEC,
+@@ -2601,7 +2616,7 @@ nm_supplicant_interface_assoc(NMSupplicantInterface       *self,
+         nm_dbus_connection_call_set(priv->dbus_connection,
+                                     priv->name_owner->str,
+                                     priv->object_path->str,
+-                                    NM_WPAS_DBUS_IFACE_INTERFACE,
++                                    priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE,
+                                     "ApIsolate",
+                                     g_variant_new_string(ap_isolation ? "1" : "0"),
+                                     DBUS_TIMEOUT_MSEC,
+@@ -2654,7 +2669,7 @@ scan_request_cb(GObject *source, GAsyncResult *result, gpointer user_data)
+         _LOGD("request-scan: request cancelled");
+     else {
+         if (error) {
+-            if (nm_dbus_error_is(error, "fi.w1.wpa_supplicant1.Interface.ScanError"))
++            if (nm_dbus_error_is(error, "fi.w1.wpa_supplicant1.Interface.ScanError", "fi.w1.wpa_supplicant1_s1g.Interface.ScanError"))
+                 _LOGD("request-scan: could not get scan request result: %s", error->message);
+             else {
+                 g_dbus_error_strip_remote_error(error);
+@@ -2727,7 +2742,7 @@ nm_supplicant_interface_request_scan(NMSupplicantInterface                   *se
+     }
+ 
+     _dbus_connection_call(self,
+-                          NM_WPAS_DBUS_IFACE_INTERFACE,
++                          priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE,
+                           "Scan",
+                           g_variant_new("(a{sv})", &builder),
+                           G_VARIANT_TYPE("()"),
+@@ -2796,6 +2811,7 @@ nm_supplicant_interface_get_max_scan_ssids(NMSupplicantInterface *self)
+ void
+ nm_supplicant_interface_p2p_start_find(NMSupplicantInterface *self, guint timeout)
+ {
++    NMSupplicantInterfacePrivate *priv;
+     GVariantBuilder builder;
+ 
+     g_return_if_fail(NM_IS_SUPPLICANT_INTERFACE(self));
+@@ -2804,8 +2820,10 @@ nm_supplicant_interface_p2p_start_find(NMSupplicantInterface *self, guint timeou
+     g_variant_builder_init(&builder, G_VARIANT_TYPE_VARDICT);
+     g_variant_builder_add(&builder, "{sv}", "Timeout", g_variant_new_int32(timeout));
+ 
++    priv = NM_SUPPLICANT_INTERFACE_GET_PRIVATE(self);
++
+     _dbus_connection_call_simple(self,
+-                                 NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE,
++                                 priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE,
+                                  "Find",
+                                  g_variant_new("(a{sv})", &builder),
+                                  G_VARIANT_TYPE("()"),
+@@ -2815,10 +2833,12 @@ nm_supplicant_interface_p2p_start_find(NMSupplicantInterface *self, guint timeou
+ void
+ nm_supplicant_interface_p2p_stop_find(NMSupplicantInterface *self)
+ {
++    NMSupplicantInterfacePrivate *priv;
+     g_return_if_fail(NM_IS_SUPPLICANT_INTERFACE(self));
+ 
++    priv = NM_SUPPLICANT_INTERFACE_GET_PRIVATE(self);
+     _dbus_connection_call_simple(self,
+-                                 NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE,
++                                 priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE,
+                                  "StopFind",
+                                  NULL,
+                                  G_VARIANT_TYPE("()"),
+@@ -2834,6 +2854,7 @@ nm_supplicant_interface_p2p_connect(NMSupplicantInterface *self,
+                                     const char            *wps_pin)
+ {
+     GVariantBuilder builder;
++    NMSupplicantInterfacePrivate *priv;
+ 
+     g_return_if_fail(NM_IS_SUPPLICANT_INTERFACE(self));
+ 
+@@ -2847,8 +2868,9 @@ nm_supplicant_interface_p2p_connect(NMSupplicantInterface *self,
+     g_variant_builder_add(&builder, "{sv}", "persistent", g_variant_new_boolean(FALSE));
+     g_variant_builder_add(&builder, "{sv}", "go_intent", g_variant_new_int32(7));
+ 
++    priv = NM_SUPPLICANT_INTERFACE_GET_PRIVATE(self);
+     _dbus_connection_call_simple(self,
+-                                 NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE,
++                                 priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE,
+                                  "Connect",
+                                  g_variant_new("(a{sv})", &builder),
+                                  G_VARIANT_TYPE("(s)"),
+@@ -2858,10 +2880,12 @@ nm_supplicant_interface_p2p_connect(NMSupplicantInterface *self,
+ void
+ nm_supplicant_interface_p2p_cancel_connect(NMSupplicantInterface *self)
+ {
++    NMSupplicantInterfacePrivate *priv;
+     g_return_if_fail(NM_IS_SUPPLICANT_INTERFACE(self));
+ 
++    priv = NM_SUPPLICANT_INTERFACE_GET_PRIVATE(self);
+     _dbus_connection_call_simple_full(self,
+-                                      NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE,
++                                      priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE,
+                                       "Cancel",
+                                       NULL,
+                                       G_VARIANT_TYPE("()"),
+@@ -2872,10 +2896,12 @@ nm_supplicant_interface_p2p_cancel_connect(NMSupplicantInterface *self)
+ void
+ nm_supplicant_interface_p2p_disconnect(NMSupplicantInterface *self)
+ {
++    NMSupplicantInterfacePrivate *priv;
+     g_return_if_fail(NM_IS_SUPPLICANT_INTERFACE(self));
+ 
++    priv = NM_SUPPLICANT_INTERFACE_GET_PRIVATE(self);
+     _dbus_connection_call_simple(self,
+-                                 NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE,
++                                 priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE,
+                                  "Disconnect",
+                                  NULL,
+                                  G_VARIANT_TYPE("()"),
+@@ -2898,10 +2924,11 @@ _properties_changed(NMSupplicantInterface *self,
+     if (initial)
+         priv->starting_pending_count--;
+ 
+-    if ((initial || priv->is_ready_main) && nm_streq(interface_name, NM_WPAS_DBUS_IFACE_INTERFACE))
++    if ((initial || priv->is_ready_main) && (nm_streq(interface_name, NM_WPAS_DBUS_IFACE_INTERFACE) || nm_streq(interface_name, NM_WPAS_DBUS_IFACE_INTERFACE_S1G)))
+         is_main = TRUE;
+     else if ((initial || priv->is_ready_p2p_device)
+-             && nm_streq(interface_name, NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE)) {
++             && (nm_streq(interface_name, NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE)
++                 || nm_streq(interface_name, NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE_S1G))) {
+         nm_assert(_get_capability(priv, NM_SUPPL_CAP_TYPE_P2P) == NM_TERNARY_TRUE);
+         is_main = FALSE;
+     } else
+@@ -3018,7 +3045,12 @@ _get_all_main_cb(GVariant *result, GError *error, gpointer user_data)
+ 
+     if (result)
+         g_variant_get(result, "(@a{sv})", &properties);
+-    _properties_changed(user_data, NM_WPAS_DBUS_IFACE_INTERFACE, properties, TRUE);
++    _properties_changed(user_data,
++                        NM_SUPPLICANT_INTERFACE_GET_PRIVATE(user_data)->is_s1g
++                            ? NM_WPAS_DBUS_IFACE_INTERFACE_S1G
++                            : NM_WPAS_DBUS_IFACE_INTERFACE,
++                        properties,
++                        TRUE);
+ }
+ 
+ static void
+@@ -3031,7 +3063,12 @@ _get_all_p2p_device_cb(GVariant *result, GError *error, gpointer user_data)
+ 
+     if (result)
+         g_variant_get(result, "(@a{sv})", &properties);
+-    _properties_changed(user_data, NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE, properties, TRUE);
++    _properties_changed(user_data,
++                        NM_SUPPLICANT_INTERFACE_GET_PRIVATE(user_data)->is_s1g
++                            ? NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE_S1G
++                            : NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE,
++                        properties,
++                        TRUE);
+ }
+ 
+ static void
+@@ -3052,7 +3089,7 @@ _signal_handle(NMSupplicantInterface *self,
+     NMSupplicantInterfacePrivate *priv = NM_SUPPLICANT_INTERFACE_GET_PRIVATE(self);
+     const char                   *path;
+ 
+-    if (nm_streq(signal_interface_name, NM_WPAS_DBUS_IFACE_INTERFACE)) {
++    if (nm_streq(signal_interface_name, NM_WPAS_DBUS_IFACE_INTERFACE) || nm_streq(signal_interface_name, NM_WPAS_DBUS_IFACE_INTERFACE_S1G) ) {
+         if (!priv->is_ready_main)
+             return;
+ 
+@@ -3108,7 +3145,7 @@ _signal_handle(NMSupplicantInterface *self,
+         return;
+     }
+ 
+-    if (nm_streq(signal_interface_name, NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE)) {
++    if (nm_streq(signal_interface_name, NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE) || nm_streq(signal_interface_name, NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE_S1G) ) {
+         if (!priv->is_ready_p2p_device)
+             return;
+ 
+@@ -3337,12 +3374,6 @@ set_property(GObject *object, guint prop_id, const GValue *value, GParamSpec *ps
+             g_object_ref(nm_supplicant_manager_get_dbus_connection(priv->supplicant_manager));
+         nm_assert(G_IS_DBUS_CONNECTION(priv->dbus_connection));
+ 
+-        priv->name_owner =
+-            nm_ref_string_ref(nm_supplicant_manager_get_dbus_name_owner(priv->supplicant_manager));
+-        nm_assert(NM_IS_REF_STRING(priv->name_owner));
+-
+-        priv->global_capabilities =
+-            nm_supplicant_manager_get_global_capabilities(priv->supplicant_manager);
+         break;
+     case PROP_DBUS_OBJECT_PATH:
+         /* construct-only */
+@@ -3408,6 +3439,16 @@ constructed(GObject *object)
+ 
+     G_OBJECT_CLASS(nm_supplicant_interface_parent_class)->constructed(object);
+ 
++    priv->is_s1g = nm_supplicant_path_is_s1g(priv->object_path->str);
++    priv->name_owner = nm_ref_string_ref(
++        nm_supplicant_manager_get_dbus_name_owner(priv->supplicant_manager,
++                                                  priv->object_path->str));
++    priv->global_capabilities =
++        nm_supplicant_manager_get_global_capabilities(priv->supplicant_manager,
++                                                      priv->object_path->str);
++
++    nm_assert(NM_IS_REF_STRING(priv->name_owner));
++
+     _LOGD("new supplicant interface %s on %s", priv->object_path->str, priv->name_owner->str);
+ 
+     priv->properties_changed_id =
+@@ -3423,7 +3464,7 @@ constructed(GObject *object)
+         nm_dbus_connection_signal_subscribe_properties_changed(priv->dbus_connection,
+                                                                priv->name_owner->str,
+                                                                NULL,
+-                                                               NM_WPAS_DBUS_IFACE_BSS,
++                                                               priv->is_s1g ? NM_WPAS_DBUS_IFACE_BSS_S1G : NM_WPAS_DBUS_IFACE_BSS,
+                                                                _bss_properties_changed_cb,
+                                                                self,
+                                                                NULL);
+@@ -3443,7 +3484,7 @@ constructed(GObject *object)
+     nm_dbus_connection_call_set(priv->dbus_connection,
+                                 priv->name_owner->str,
+                                 priv->object_path->str,
+-                                NM_WPAS_DBUS_IFACE_INTERFACE,
++                                priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE,
+                                 "BSSExpireAge",
+                                 g_variant_new_uint32(250),
+                                 DBUS_TIMEOUT_MSEC,
+@@ -3453,7 +3494,7 @@ constructed(GObject *object)
+     nm_dbus_connection_call_set(priv->dbus_connection,
+                                 priv->name_owner->str,
+                                 priv->object_path->str,
+-                                NM_WPAS_DBUS_IFACE_INTERFACE,
++                                priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE,
+                                 "BSSExpireCount",
+                                 g_variant_new_uint32(2),
+                                 DBUS_TIMEOUT_MSEC,
+@@ -3466,7 +3507,7 @@ constructed(GObject *object)
+         nm_dbus_connection_call_set(priv->dbus_connection,
+                                     priv->name_owner->str,
+                                     priv->object_path->str,
+-                                    NM_WPAS_DBUS_IFACE_INTERFACE,
++                                    priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE,
+                                     "Pmf",
+                                     g_variant_new_string("1"),
+                                     DBUS_TIMEOUT_MSEC,
+@@ -3498,7 +3539,7 @@ constructed(GObject *object)
+     nm_dbus_connection_call_get_all(priv->dbus_connection,
+                                     priv->name_owner->str,
+                                     priv->object_path->str,
+-                                    NM_WPAS_DBUS_IFACE_INTERFACE,
++                                    priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE,
+                                     5000,
+                                     priv->main_cancellable,
+                                     _get_all_main_cb,
+@@ -3509,7 +3550,7 @@ constructed(GObject *object)
+             nm_dbus_connection_signal_subscribe_properties_changed(priv->dbus_connection,
+                                                                    priv->name_owner->str,
+                                                                    NULL,
+-                                                                   NM_WPAS_DBUS_IFACE_PEER,
++                                                                   priv->is_s1g ? NM_WPAS_DBUS_IFACE_PEER_S1G : NM_WPAS_DBUS_IFACE_PEER,
+                                                                    _peer_properties_changed_cb,
+                                                                    self,
+                                                                    NULL);
+@@ -3518,7 +3559,7 @@ constructed(GObject *object)
+         nm_dbus_connection_call_get_all(priv->dbus_connection,
+                                         priv->name_owner->str,
+                                         priv->object_path->str,
+-                                        NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE,
++                                        priv->is_s1g ? NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE_S1G : NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE,
+                                         5000,
+                                         priv->main_cancellable,
+                                         _get_all_p2p_device_cb,
+diff --git a/src/core/supplicant/nm-supplicant-manager.c b/src/core/supplicant/nm-supplicant-manager.c
+index 3b805693..929eaaad 100644
+--- a/src/core/supplicant/nm-supplicant-manager.c
++++ b/src/core/supplicant/nm-supplicant-manager.c
+@@ -20,8 +20,36 @@
+ 
+ #define CREATE_IFACE_TRY_COUNT_MAX 7u
+ 
++typedef struct _SupplInst SupplInst;
++
++struct _SupplInst {
++    NMSupplicantManager *self;
++
++    const char *service;
++    const char *path;
++    const char *interface;
++
++    NMRefString *name_owner;
++
++    GCancellable *get_name_owner_cancellable;
++    GCancellable *get_capabilities_cancellable;
++    GCancellable *poke_name_owner_cancellable;
++
++    NMSupplCapMask capabilities;
++
++    guint name_owner_changed_id;
++    guint interface_removed_id;
++    guint poke_name_owner_timeout_id;
++    guint available_reset_id;
++
++    NMTernary available : 2;
++
++    bool is_s1g;
++};
++
+ struct _NMSupplMgrCreateIfaceHandle {
+     NMSupplicantManager                 *self;
++    SupplInst                           *inst;
+     CList                                create_iface_lst;
+     GCancellable                        *cancellable;
+     NMSupplicantManagerCreateInterfaceCb callback;
+@@ -45,29 +73,18 @@ static guint signals[LAST_SIGNAL] = {0};
+ typedef struct {
+     GDBusConnection *dbus_connection;
+ 
+-    NMRefString *name_owner;
+-
+-    GCancellable *get_name_owner_cancellable;
+-    GCancellable *get_capabilities_cancellable;
+-    GCancellable *poke_name_owner_cancellable;
++    /* [0] is the stock wpa_supplicant, [1] is wpa_supplicant_s1g */
++    SupplInst inst[2];
+ 
+     GHashTable *supp_ifaces;
+     CList       supp_lst_head;
+ 
+     CList create_iface_lst_head;
+-
+-    NMSupplCapMask capabilities;
+-
+-    guint name_owner_changed_id;
+-    guint interface_removed_id;
+-    guint poke_name_owner_timeout_id;
+-    guint available_reset_id;
+-
+-    /* see nm_supplicant_manager_get_available(). */
+-    NMTernary available : 2;
+-
+ } NMSupplicantManagerPrivate;
+ 
++#define INST_STOCK(priv) (&(priv)->inst[0])
++#define INST_S1G(priv)   (&(priv)->inst[1])
++
+ struct _NMSupplicantManager {
+     GObject                    parent;
+     NMSupplicantManagerPrivate _priv;
+@@ -97,10 +114,16 @@ NM_CACHED_QUARK_FCN("nm-supplicant-error-quark", nm_supplicant_error_quark);
+ 
+ /*****************************************************************************/
+ 
+-static void     _create_iface_proceed_all(NMSupplicantManager *self, GError *error);
++static void     _create_iface_proceed_all(NMSupplicantManager *self,
++                                          SupplInst           *inst,
++                                          GError              *error);
+ static void     _supp_iface_add(NMSupplicantManager   *self,
+                                 NMRefString           *iface_path,
+                                 NMSupplicantInterface *supp_iface);
++static void     _supp_iface_remove_all(NMSupplicantManager *self,
++                                       SupplInst           *inst,
++                                       gboolean             force_remove_from_supplicant,
++                                       const char          *reason);
+ static void     _supp_iface_remove_one(NMSupplicantManager   *self,
+                                        NMSupplicantInterface *supp_iface,
+                                        gboolean               force_remove_from_supplicant,
+@@ -131,17 +154,33 @@ NM_UTILS_LOOKUP_STR_DEFINE(nm_supplicant_driver_to_string,
+ NMTernary
+ nm_supplicant_manager_is_available(NMSupplicantManager *self)
+ {
++    NMSupplicantManagerPrivate *priv;
++    NMTernary                   result = NM_TERNARY_FALSE;
++    guint                       i;
++
+     g_return_val_if_fail(NM_IS_SUPPLICANT_MANAGER(self), NM_TERNARY_FALSE);
+ 
+-    return NM_SUPPLICANT_MANAGER_GET_PRIVATE(self)->available;
++    priv = NM_SUPPLICANT_MANAGER_GET_PRIVATE(self);
++
++    /* If either supplicant is available report available. */
++    for (i = 0; i < G_N_ELEMENTS(priv->inst); i++) {
++        if (priv->inst[i].available == NM_TERNARY_TRUE)
++            return NM_TERNARY_TRUE;
++        if (priv->inst[i].available == NM_TERNARY_DEFAULT)
++            result = NM_TERNARY_DEFAULT;
++    }
++    return result;
+ }
+ 
+ NMRefString *
+-nm_supplicant_manager_get_dbus_name_owner(NMSupplicantManager *self)
++nm_supplicant_manager_get_dbus_name_owner(NMSupplicantManager *self, const char *object_path)
+ {
+     g_return_val_if_fail(NM_IS_SUPPLICANT_MANAGER(self), NULL);
+ 
+-    return NM_SUPPLICANT_MANAGER_GET_PRIVATE(self)->name_owner;
++    return (nm_supplicant_path_is_s1g(object_path)
++                ? INST_S1G(NM_SUPPLICANT_MANAGER_GET_PRIVATE(self))
++                : INST_STOCK(NM_SUPPLICANT_MANAGER_GET_PRIVATE(self)))
++        ->name_owner;
+ }
+ 
+ GDBusConnection *
+@@ -153,19 +192,22 @@ nm_supplicant_manager_get_dbus_connection(NMSupplicantManager *self)
+ }
+ 
+ NMSupplCapMask
+-nm_supplicant_manager_get_global_capabilities(NMSupplicantManager *self)
++nm_supplicant_manager_get_global_capabilities(NMSupplicantManager *self, const char *object_path)
+ {
+     g_return_val_if_fail(NM_IS_SUPPLICANT_MANAGER(self), NM_SUPPL_CAP_MASK_NONE);
+ 
+-    return NM_SUPPLICANT_MANAGER_GET_PRIVATE(self)->capabilities;
++    return (nm_supplicant_path_is_s1g(object_path)
++                ? INST_S1G(NM_SUPPLICANT_MANAGER_GET_PRIVATE(self))
++                : INST_STOCK(NM_SUPPLICANT_MANAGER_GET_PRIVATE(self)))
++        ->capabilities;
+ }
+ 
+ /*****************************************************************************/
+ 
+ static void
+-_caps_set(NMSupplicantManagerPrivate *priv, NMSupplCapType type, NMTernary value)
++_caps_set(SupplInst *inst, NMSupplCapType type, NMTernary value)
+ {
+-    priv->capabilities = NM_SUPPL_CAP_MASK_SET(priv->capabilities, type, value);
++    inst->capabilities = NM_SUPPL_CAP_MASK_SET(inst->capabilities, type, value);
+ }
+ 
+ /*****************************************************************************/
+@@ -175,14 +217,16 @@ _dbus_call_remove_interface(GDBusConnection *dbus_connection,
+                             const char      *name_owner,
+                             const char      *iface_path)
+ {
++    const gboolean is_s1g = nm_supplicant_path_is_s1g(iface_path);
++
+     nm_assert(G_IS_DBUS_CONNECTION(dbus_connection));
+     nm_assert(name_owner);
+     nm_assert(iface_path);
+ 
+     g_dbus_connection_call(dbus_connection,
+                            name_owner,
+-                           NM_WPAS_DBUS_PATH,
+-                           NM_WPAS_DBUS_INTERFACE,
++                           is_s1g ? NM_WPAS_DBUS_PATH_S1G : NM_WPAS_DBUS_PATH,
++                           is_s1g ? NM_WPAS_DBUS_INTERFACE_S1G : NM_WPAS_DBUS_INTERFACE,
+                            "RemoveInterface",
+                            g_variant_new("(o)", iface_path),
+                            G_VARIANT_TYPE("()"),
+@@ -229,35 +273,40 @@ void
+ nm_supplicant_manager_set_wfd_ies(NMSupplicantManager *self, GBytes *wfd_ies)
+ {
+     NMSupplicantManagerPrivate *priv;
+-    GVariantBuilder             params;
++    guint                       i;
+ 
+     g_return_if_fail(NM_IS_SUPPLICANT_MANAGER(self));
+ 
+     priv = NM_SUPPLICANT_MANAGER_GET_PRIVATE(self);
+ 
+-    if (!priv->name_owner)
+-        return;
+-
+-    _LOGD("setting WFD IEs for P2P operation on %s", priv->name_owner->str);
+-
+-    g_variant_builder_init(&params, G_VARIANT_TYPE("(ssv)"));
+-
+-    g_variant_builder_add(&params, "s", NM_WPAS_DBUS_INTERFACE);
+-    g_variant_builder_add(&params, "s", "WFDIEs");
+-    g_variant_builder_add_value(&params, g_variant_new_variant(nm_g_bytes_to_variant_ay(wfd_ies)));
+-
+-    g_dbus_connection_call(priv->dbus_connection,
+-                           priv->name_owner->str,
+-                           NM_WPAS_DBUS_PATH,
+-                           DBUS_INTERFACE_PROPERTIES,
+-                           "Set",
+-                           g_variant_builder_end(&params),
+-                           G_VARIANT_TYPE("()"),
+-                           G_DBUS_CALL_FLAGS_NO_AUTO_START,
+-                           3000,
+-                           NULL,
+-                           on_supplicant_wfd_ies_set,
+-                           NULL);
++    /* Set it on every supplicant that is running. Each call needs its own
++     * variant: a GVariantBuilder cannot be reused once it was ended. */
++    for (i = 0; i < G_N_ELEMENTS(priv->inst); i++) {
++        SupplInst *inst = &priv->inst[i];
++
++        if (!inst->name_owner)
++            continue;
++
++        _LOGD("setting WFD IEs for P2P operation on %s (%s)",
++              inst->name_owner->str,
++              inst->service);
++
++        g_dbus_connection_call(priv->dbus_connection,
++                               inst->name_owner->str,
++                               inst->path,
++                               DBUS_INTERFACE_PROPERTIES,
++                               "Set",
++                               g_variant_new("(ssv)",
++                                             inst->interface,
++                                             "WFDIEs",
++                                             nm_g_bytes_to_variant_ay(wfd_ies)),
++                               G_VARIANT_TYPE("()"),
++                               G_DBUS_CALL_FLAGS_NO_AUTO_START,
++                               3000,
++                               NULL,
++                               on_supplicant_wfd_ies_set,
++                               NULL);
++    }
+ }
+ 
+ /*****************************************************************************/
+@@ -265,35 +314,36 @@ nm_supplicant_manager_set_wfd_ies(NMSupplicantManager *self, GBytes *wfd_ies)
+ static gboolean
+ _poke_name_owner_timeout_cb(gpointer user_data)
+ {
+-    NMSupplicantManager        *self              = user_data;
+-    NMSupplicantManagerPrivate *priv              = NM_SUPPLICANT_MANAGER_GET_PRIVATE(self);
++    SupplInst                  *inst              = user_data;
++    NMSupplicantManager        *self              = inst->self;
+     gs_free_error GError       *error             = NULL;
+     gboolean                    available_changed = FALSE;
+ 
+-    nm_assert(!priv->name_owner);
++    nm_assert(!inst->name_owner);
+ 
+-    priv->poke_name_owner_timeout_id = 0;
+-    nm_clear_g_cancellable(&priv->poke_name_owner_cancellable);
++    inst->poke_name_owner_timeout_id = 0;
++    nm_clear_g_cancellable(&inst->poke_name_owner_cancellable);
+ 
+     _LOGT("poke service \"%s\" failed for good with timeout%s",
+-          NM_WPAS_DBUS_SERVICE,
+-          (priv->available == NM_TERNARY_DEFAULT) ? " (set as not available)" : "");
++          inst->service,
++          (inst->available == NM_TERNARY_DEFAULT) ? " (set as not available)" : "");
+ 
+-    if (priv->available == NM_TERNARY_DEFAULT) {
++    if (inst->available == NM_TERNARY_DEFAULT) {
+         /* the available flag usually only changes together with the name-owner.
+          * However, if we tries to poke the service but failed to start it (with
+          * timeout), was also set it as (hard) not available. */
+-        priv->available = NM_TERNARY_FALSE;
+-        nm_clear_g_source(&priv->available_reset_id);
+-        priv->available_reset_id = g_timeout_add_seconds(60, _available_reset_cb, self);
++        inst->available = NM_TERNARY_FALSE;
++        nm_clear_g_source(&inst->available_reset_id);
++        inst->available_reset_id = g_timeout_add_seconds(60, _available_reset_cb, inst);
+         available_changed        = TRUE;
+     }
+ 
+     nm_utils_error_set(&error,
+                        NM_UTILS_ERROR_UNKNOWN,
+-                       "Failed to D-Bus activate wpa_supplicant service");
++                       "Failed to D-Bus activate %s service",
++                       inst->service);
+ 
+-    _create_iface_proceed_all(self, error);
++    _create_iface_proceed_all(self, inst, error);
+ 
+     if (available_changed) {
+         /* We delay the emitting of the notification after aborting all
+@@ -307,6 +357,7 @@ _poke_name_owner_timeout_cb(gpointer user_data)
+ static void
+ _poke_name_owner_cb(GObject *source, GAsyncResult *result, gpointer user_data)
+ {
++    SupplInst                 *inst  = user_data;
+     gs_unref_variant GVariant *res   = NULL;
+     gs_free_error GError      *error = NULL;
+ 
+@@ -315,32 +366,32 @@ _poke_name_owner_cb(GObject *source, GAsyncResult *result, gpointer user_data)
+         return;
+ 
+     if (!res)
+-        _LOGT("poke service \"%s\" failed: %s", NM_WPAS_DBUS_SERVICE, error->message);
++        _LOGT("poke service \"%s\" failed: %s", inst->service, error->message);
+     else
+-        _LOGT("poke service \"%s\" succeeded", NM_WPAS_DBUS_SERVICE);
++        _LOGT("poke service \"%s\" succeeded", inst->service);
+ 
+     /* in both cases, we react the same: we wait for the name owner to appear
+      * or hit the timeout. */
+ }
+ 
+ static void
+-_poke_name_owner(NMSupplicantManager *self)
++_poke_name_owner(SupplInst *inst)
+ {
+-    NMSupplicantManagerPrivate *priv = NM_SUPPLICANT_MANAGER_GET_PRIVATE(self);
++    NMSupplicantManagerPrivate *priv = NM_SUPPLICANT_MANAGER_GET_PRIVATE(inst->self);
+ 
+-    if (priv->poke_name_owner_cancellable)
++    if (inst->poke_name_owner_cancellable)
+         return;
+ 
+-    _LOGT("poke service \"%s\"...", NM_WPAS_DBUS_SERVICE);
++    _LOGT("poke service \"%s\"...", inst->service);
+ 
+-    priv->poke_name_owner_cancellable = g_cancellable_new();
+-    priv->poke_name_owner_timeout_id  = g_timeout_add(3000, _poke_name_owner_timeout_cb, self);
++    inst->poke_name_owner_cancellable = g_cancellable_new();
++    inst->poke_name_owner_timeout_id  = g_timeout_add(3000, _poke_name_owner_timeout_cb, inst);
+     nm_dbus_connection_call_start_service_by_name(priv->dbus_connection,
+-                                                  NM_WPAS_DBUS_SERVICE,
++                                                  inst->service,
+                                                   5000,
+-                                                  priv->poke_name_owner_cancellable,
++                                                  inst->poke_name_owner_cancellable,
+                                                   _poke_name_owner_cb,
+-                                                  self);
++                                                  inst);
+ }
+ 
+ /*****************************************************************************/
+@@ -404,7 +455,7 @@ _create_iface_add(NMSupplicantManager         *self,
+               "]: interface %s on %s created (already existing)",
+               NM_HASH_OBFUSCATE_PTR(handle),
+               iface_path_str,
+-              priv->name_owner->str);
++              handle->name_owner->str);
+         _create_iface_complete(handle, supp_iface, NULL);
+         return;
+     }
+@@ -412,7 +463,7 @@ _create_iface_add(NMSupplicantManager         *self,
+     _LOGT("create-iface[" NM_HASH_OBFUSCATE_PTR_FMT "]: interface %s on %s created%s",
+           NM_HASH_OBFUSCATE_PTR(handle),
+           iface_path_str,
+-          priv->name_owner->str,
++          handle->name_owner->str,
+           created_by_us ? " (created by us)" : "");
+ 
+     supp_iface = nm_supplicant_interface_new(self, iface_path, handle->ifindex, handle->driver);
+@@ -428,7 +479,6 @@ _create_iface_dbus_call_get_interface_cb(GObject *source, GAsyncResult *result,
+     GDBusConnection             *dbus_connection = G_DBUS_CONNECTION(source);
+     NMSupplMgrCreateIfaceHandle *handle;
+     NMSupplicantManager         *self;
+-    NMSupplicantManagerPrivate  *priv;
+     gs_unref_variant GVariant   *res   = NULL;
+     gs_free_error GError        *error = NULL;
+     const char                  *iface_path_str;
+@@ -442,15 +492,14 @@ _create_iface_dbus_call_get_interface_cb(GObject *source, GAsyncResult *result,
+     nm_assert(handle->callback);
+ 
+     self = handle->self;
+-    priv = NM_SUPPLICANT_MANAGER_GET_PRIVATE(self);
+ 
+-    nm_assert(handle->name_owner == priv->name_owner);
++    nm_assert(handle->name_owner == handle->inst->name_owner);
+ 
+     if (!res) {
+         char ifname[NM_IFNAMSIZ];
+ 
+         if (handle->create_iface_try_count < CREATE_IFACE_TRY_COUNT_MAX
+-            && nm_dbus_error_is(error, NM_WPAS_ERROR_UNKNOWN_IFACE)
++            && nm_dbus_error_is(error, NM_WPAS_ERROR_UNKNOWN_IFACE, NM_WPAS_ERROR_UNKNOWN_IFACE_S1G)
+             && nm_platform_if_indextoname(NM_PLATFORM_GET, handle->ifindex, ifname)) {
+             /* Before, supplicant told us the interface existed. Was there a race?
+              * Try again. */
+@@ -485,7 +534,6 @@ _create_iface_dbus_call_create_interface_cb(GObject      *source,
+     GDBusConnection             *dbus_connection = G_DBUS_CONNECTION(source);
+     NMSupplMgrCreateIfaceHandle *handle          = user_data;
+     NMSupplicantManager         *self;
+-    NMSupplicantManagerPrivate  *priv;
+     gs_unref_variant GVariant   *res   = NULL;
+     gs_free_error GError        *error = NULL;
+     const char                  *iface_path_str;
+@@ -500,7 +548,7 @@ _create_iface_dbus_call_create_interface_cb(GObject      *source,
+                 nm_assert(handle->self);
+                 TRUE;
+             })
+-            && nm_dbus_error_is(error, NM_WPAS_ERROR_EXISTS_ERROR)
++            && nm_dbus_error_is(error, NM_WPAS_ERROR_EXISTS_ERROR, NM_WPAS_ERROR_EXISTS_ERROR_S1G)
+             && nm_platform_if_indextoname(NM_PLATFORM_GET, handle->ifindex, ifname)) {
+             self = handle->self;
+             _LOGT("create-iface[" NM_HASH_OBFUSCATE_PTR_FMT
+@@ -522,11 +570,12 @@ _create_iface_dbus_call_create_interface_cb(GObject      *source,
+     g_clear_object(&handle->cancellable);
+ 
+     self = handle->self;
+-    priv = self ? NM_SUPPLICANT_MANAGER_GET_PRIVATE(self) : NULL;
+ 
+     g_variant_get(res, "(&o)", &iface_path_str);
+ 
+-    if (!handle->callback || priv->name_owner != handle->name_owner) {
++    /* handle->callback used as an indication that the manager is up
++     * and handle->inst is valid. */
++    if (!handle->callback || handle->inst->name_owner != handle->name_owner) {
+         if (!handle->callback) {
+             _LOGT("create-iface[" NM_HASH_OBFUSCATE_PTR_FMT
+                   "]: request already cancelled but still remove interface %s in %s",
+@@ -552,6 +601,32 @@ _create_iface_dbus_call_create_interface_cb(GObject      *source,
+     _create_iface_add(self, handle, iface_path_str, TRUE);
+ }
+ 
++static gboolean
++_iface_is_s1g(const char *ifname)
++{
++    char    path[PATH_MAX];
++    char    buf[PATH_MAX];
++    ssize_t len;
++
++    nm_sprintf_buf(path, "/sys/class/net/%s/device/driver", ifname);
++    len = readlink(path, buf, sizeof(buf) - 1);
++    if (len < 0)
++        return FALSE;
++    buf[len] = '\0';
++
++    return strstr(buf, "morse") != NULL;
++}
++
++static SupplInst *
++_inst_for_ifindex(NMSupplicantManagerPrivate *priv, int ifindex)
++{
++    char ifname[NM_IFNAMSIZ];
++
++    if (nm_platform_if_indextoname(NM_PLATFORM_GET, ifindex, ifname) && _iface_is_s1g(ifname))
++        return INST_S1G(priv);
++    return INST_STOCK(priv);
++}
++
+ static void
+ _create_iface_dbus_call_get_interface(NMSupplicantManager         *self,
+                                       NMSupplMgrCreateIfaceHandle *handle,
+@@ -561,11 +636,12 @@ _create_iface_dbus_call_get_interface(NMSupplicantManager         *self,
+ 
+     nm_assert(handle->cancellable);
+     nm_assert(!handle->shutdown_handle);
++    nm_assert(handle->name_owner);
+ 
+     g_dbus_connection_call(priv->dbus_connection,
+-                           priv->name_owner->str,
+-                           NM_WPAS_DBUS_PATH,
+-                           NM_WPAS_DBUS_INTERFACE,
++                           handle->name_owner->str,
++                           handle->inst->path,
++                           handle->inst->interface,
+                            "GetInterface",
+                            g_variant_new("(s)", ifname),
+                            G_VARIANT_TYPE("(o)"),
+@@ -584,7 +660,7 @@ _create_iface_dbus_call_create_interface(NMSupplicantManager         *self,
+     NMSupplicantManagerPrivate *priv = NM_SUPPLICANT_MANAGER_GET_PRIVATE(self);
+     GVariantBuilder             builder;
+ 
+-    nm_assert(priv->name_owner == handle->name_owner);
++    nm_assert(handle->inst->name_owner == handle->name_owner);
+     nm_assert(handle->cancellable);
+     nm_assert(!handle->shutdown_handle);
+     nm_assert(handle->create_iface_try_count <= CREATE_IFACE_TRY_COUNT_MAX);
+@@ -603,8 +679,8 @@ _create_iface_dbus_call_create_interface(NMSupplicantManager         *self,
+     handle->create_iface_try_count++;
+     g_dbus_connection_call(priv->dbus_connection,
+                            handle->name_owner->str,
+-                           NM_WPAS_DBUS_PATH,
+-                           NM_WPAS_DBUS_INTERFACE,
++                           handle->inst->path,
++                           handle->inst->interface,
+                            "CreateInterface",
+                            g_variant_new("(a{sv})", &builder),
+                            G_VARIANT_TYPE("(o)"),
+@@ -618,12 +694,23 @@ _create_iface_dbus_call_create_interface(NMSupplicantManager         *self,
+ static void
+ _create_iface_dbus_start(NMSupplicantManager *self, NMSupplMgrCreateIfaceHandle *handle)
+ {
+-    NMSupplicantManagerPrivate *priv = NM_SUPPLICANT_MANAGER_GET_PRIVATE(self);
+-    char                        ifname[NM_IFNAMSIZ];
++    SupplInst *inst = handle->inst;
++    char       ifname[NM_IFNAMSIZ];
+ 
+-    nm_assert(priv->name_owner);
+     nm_assert(!handle->cancellable);
+ 
++    if (!inst->name_owner) {
++        nm_utils_error_set(&handle->fail_on_idle_error,
++                           NM_UTILS_ERROR_UNKNOWN,
++                           "%s is not running",
++                           inst->service);
++        _LOGT("create-iface[" NM_HASH_OBFUSCATE_PTR_FMT "]: %s is not running",
++              NM_HASH_OBFUSCATE_PTR(handle),
++              inst->service);
++        handle->fail_on_idle_id = g_idle_add(_create_iface_fail_on_idle_cb, handle);
++        return;
++    }
++
+     if (!nm_platform_if_indextoname(NM_PLATFORM_GET, handle->ifindex, ifname)) {
+         nm_utils_error_set(&handle->fail_on_idle_error,
+                            NM_UTILS_ERROR_UNKNOWN,
+@@ -652,7 +739,7 @@ _create_iface_dbus_start(NMSupplicantManager *self, NMSupplMgrCreateIfaceHandle
+      *
+      * See also handle->shutdown_handle.
+      */
+-    handle->name_owner  = nm_ref_string_ref(priv->name_owner);
++    handle->name_owner  = nm_ref_string_ref(inst->name_owner);
+     handle->cancellable = g_cancellable_new();
+     _LOGT("create-iface[" NM_HASH_OBFUSCATE_PTR_FMT "]: creating interface (ifname \"%s\")...",
+           NM_HASH_OBFUSCATE_PTR(handle),
+@@ -684,6 +771,7 @@ nm_supplicant_manager_create_interface(NMSupplicantManager                 *self
+ {
+     NMSupplicantManagerPrivate  *priv;
+     NMSupplMgrCreateIfaceHandle *handle;
++    SupplInst                   *inst;
+ 
+     g_return_val_if_fail(NM_IS_SUPPLICANT_MANAGER(self), NULL);
+     g_return_val_if_fail(ifindex > 0, NULL);
+@@ -692,9 +780,12 @@ nm_supplicant_manager_create_interface(NMSupplicantManager                 *self
+ 
+     priv = NM_SUPPLICANT_MANAGER_GET_PRIVATE(self);
+ 
++    inst = _inst_for_ifindex(priv, ifindex);
++
+     handle  = g_slice_new(NMSupplMgrCreateIfaceHandle);
+     *handle = (NMSupplMgrCreateIfaceHandle){
+         .self               = g_object_ref(self),
++        .inst               = inst,
+         .callback           = callback,
+         .callback_user_data = user_data,
+         .driver             = driver,
+@@ -716,24 +807,24 @@ nm_supplicant_manager_create_interface(NMSupplicantManager                 *self
+         return handle;
+     }
+ 
+-    if (!priv->name_owner) {
++    if (!inst->name_owner) {
+         _LOGT(
+             "create-iface[" NM_HASH_OBFUSCATE_PTR_FMT "]: new request interface %d (driver %s). %s",
+             NM_HASH_OBFUSCATE_PTR(handle),
+             ifindex,
+             nm_supplicant_driver_to_string(driver),
+-            priv->poke_name_owner_cancellable ? "Waiting for supplicant..." : "Poke supplicant...");
+-        _poke_name_owner(self);
++            inst->poke_name_owner_cancellable ? "Waiting for supplicant..." : "Poke supplicant...");
++        _poke_name_owner(inst);
+         return handle;
+     }
+ 
+-    if (priv->get_capabilities_cancellable) {
++    if (inst->get_capabilities_cancellable) {
+         _LOGT("create-iface[" NM_HASH_OBFUSCATE_PTR_FMT
+               "]: new request interface %d (driver %s). Waiting to fetch capabilities for %s...",
+               NM_HASH_OBFUSCATE_PTR(handle),
+               ifindex,
+               nm_supplicant_driver_to_string(driver),
+-              priv->name_owner->str);
++              inst->name_owner->str);
+         return handle;
+     }
+ 
+@@ -742,33 +833,40 @@ nm_supplicant_manager_create_interface(NMSupplicantManager                 *self
+           NM_HASH_OBFUSCATE_PTR(handle),
+           ifindex,
+           nm_supplicant_driver_to_string(driver),
+-          priv->name_owner->str);
++          inst->name_owner->str);
+ 
+     _create_iface_dbus_start(self, handle);
+     return handle;
+ }
+ 
+ static void
+-_create_iface_proceed_all(NMSupplicantManager *self, GError *error)
++_create_iface_proceed_all(NMSupplicantManager *self, SupplInst *inst, GError *error)
+ {
+     NMSupplicantManagerPrivate  *priv = NM_SUPPLICANT_MANAGER_GET_PRIVATE(self);
+     NMSupplMgrCreateIfaceHandle *handle;
+ 
+-    nm_assert(error || priv->name_owner);
+-    nm_assert(error || !priv->get_capabilities_cancellable);
++    nm_assert(error || inst->name_owner);
++    nm_assert(error || !inst->get_capabilities_cancellable);
+ 
+     if (c_list_is_empty(&priv->create_iface_lst_head))
+         return;
+ 
+     if (error) {
+-        CList alt_list;
++        NMSupplMgrCreateIfaceHandle *handle_safe;
++        CList                        alt_list;
+ 
+         /* we move the handles we want to proceed to a alternative list.
+          * That is, because we invoke callbacks to the caller, who might
+          * create another request right away. We don't want to proceed
+-         * that one. */
++         * that one. Only the requests that wait for @inst are affected;
++         * the other supplicant is not interested. */
+         c_list_init(&alt_list);
+-        c_list_splice(&alt_list, &priv->create_iface_lst_head);
++        c_list_for_each_entry_safe (handle, handle_safe, &priv->create_iface_lst_head, create_iface_lst) {
++            if (handle->inst != inst)
++                continue;
++            c_list_unlink(&handle->create_iface_lst);
++            c_list_link_tail(&alt_list, &handle->create_iface_lst);
++        }
+ 
+         while ((handle =
+                     c_list_last_entry(&alt_list, NMSupplMgrCreateIfaceHandle, create_iface_lst))) {
+@@ -781,12 +879,14 @@ _create_iface_proceed_all(NMSupplicantManager *self, GError *error)
+         return;
+     }
+ 
+-    /* start all the handles. This does not invoke callbacks, so the list of handles
+-     * cannot be modified while we iterate it. */
++    /* start all the handles of @inst. This does not invoke callbacks, so the
++     * list of handles cannot be modified while we iterate it. */
+     c_list_for_each_entry (handle, &priv->create_iface_lst_head, create_iface_lst) {
++        if (handle->inst != inst)
++            continue;
+         _LOGT("create-iface[" NM_HASH_OBFUSCATE_PTR_FMT "]: create interface on %s...",
+               NM_HASH_OBFUSCATE_PTR(handle),
+-              priv->name_owner->str);
++              inst->name_owner->str);
+         _create_iface_dbus_start(self, handle);
+     }
+ }
+@@ -819,6 +919,9 @@ nm_supplicant_manager_create_interface_from_path(NMSupplicantManager *self, cons
+ 
+     priv = NM_SUPPLICANT_MANAGER_GET_PRIVATE(self);
+ 
++    if (!(nm_supplicant_path_is_s1g(object_path) ? INST_S1G(priv) : INST_STOCK(priv))->name_owner)
++        return NULL;
++
+     iface_path = nm_ref_string_new(object_path);
+ 
+     supp_iface = g_hash_table_lookup(priv->supp_ifaces, iface_path);
+@@ -844,13 +947,14 @@ _dbus_interface_removed_cb(GDBusConnection *connection,
+                            GVariant        *parameters,
+                            gpointer         user_data)
+ {
+-    NMSupplicantManager            *self = user_data;
++    SupplInst                      *inst = user_data;
++    NMSupplicantManager            *self = inst->self;
+     NMSupplicantManagerPrivate     *priv = NM_SUPPLICANT_MANAGER_GET_PRIVATE(self);
+     NMSupplicantInterface          *supp_iface;
+     const char                     *iface_path_str;
+     nm_auto_ref_string NMRefString *iface_path = NULL;
+ 
+-    nm_assert(nm_streq(sender_name, priv->name_owner->str));
++    nm_assert(inst->name_owner && nm_streq(sender_name, inst->name_owner->str));
+ 
+     if (!g_variant_is_of_type(parameters, G_VARIANT_TYPE("(o)")))
+         return;
+@@ -871,16 +975,13 @@ _dbus_interface_removed_cb(GDBusConnection *connection,
+ static void
+ _dbus_get_capabilities_cb(GVariant *res, GError *error, gpointer user_data)
+ {
+-    NMSupplicantManager        *self;
+-    NMSupplicantManagerPrivate *priv;
++    SupplInst           *inst = user_data;
++    NMSupplicantManager *self = inst->self;
+ 
+     if (nm_utils_error_is_cancelled(error))
+         return;
+ 
+-    self = user_data;
+-    priv = NM_SUPPLICANT_MANAGER_GET_PRIVATE(self);
+-
+-    g_clear_object(&priv->get_capabilities_cancellable);
++    g_clear_object(&inst->get_capabilities_cancellable);
+ 
+     /* The supplicant only advertises global capabilities if the following
+      * commit has been applied:
+@@ -891,17 +992,17 @@ _dbus_get_capabilities_cb(GVariant *res, GError *error, gpointer user_data)
+      *
+      * dbus: Add global capabilities property
+      */
+-    _caps_set(priv, NM_SUPPL_CAP_TYPE_AP, NM_TERNARY_DEFAULT);
+-    _caps_set(priv, NM_SUPPL_CAP_TYPE_PMF, NM_TERNARY_DEFAULT);
+-    _caps_set(priv, NM_SUPPL_CAP_TYPE_FILS, NM_TERNARY_DEFAULT);
++    _caps_set(inst, NM_SUPPL_CAP_TYPE_AP, NM_TERNARY_DEFAULT);
++    _caps_set(inst, NM_SUPPL_CAP_TYPE_PMF, NM_TERNARY_DEFAULT);
++    _caps_set(inst, NM_SUPPL_CAP_TYPE_FILS, NM_TERNARY_DEFAULT);
+ 
+     /* Support for the following is newer than the capabilities property */
+-    _caps_set(priv, NM_SUPPL_CAP_TYPE_P2P, NM_TERNARY_FALSE);
+-    _caps_set(priv, NM_SUPPL_CAP_TYPE_FT, NM_TERNARY_FALSE);
+-    _caps_set(priv, NM_SUPPL_CAP_TYPE_SHA384, NM_TERNARY_FALSE);
+-    _caps_set(priv, NM_SUPPL_CAP_TYPE_MESH, NM_TERNARY_FALSE);
+-    _caps_set(priv, NM_SUPPL_CAP_TYPE_FAST, NM_TERNARY_FALSE);
+-    _caps_set(priv, NM_SUPPL_CAP_TYPE_WFD, NM_TERNARY_FALSE);
++    _caps_set(inst, NM_SUPPL_CAP_TYPE_P2P, NM_TERNARY_FALSE);
++    _caps_set(inst, NM_SUPPL_CAP_TYPE_FT, NM_TERNARY_FALSE);
++    _caps_set(inst, NM_SUPPL_CAP_TYPE_SHA384, NM_TERNARY_FALSE);
++    _caps_set(inst, NM_SUPPL_CAP_TYPE_MESH, NM_TERNARY_FALSE);
++    _caps_set(inst, NM_SUPPL_CAP_TYPE_FAST, NM_TERNARY_FALSE);
++    _caps_set(inst, NM_SUPPL_CAP_TYPE_WFD, NM_TERNARY_FALSE);
+ 
+     if (res) {
+         nm_auto_free_variant_iter GVariantIter *res_iter = NULL;
+@@ -916,47 +1017,47 @@ _dbus_get_capabilities_cb(GVariant *res, GError *error, gpointer user_data)
+                     const char         **a;
+ 
+                     array = g_variant_get_strv(res_val, NULL);
+-                    _caps_set(priv, NM_SUPPL_CAP_TYPE_AP, NM_TERNARY_FALSE);
+-                    _caps_set(priv, NM_SUPPL_CAP_TYPE_PMF, NM_TERNARY_FALSE);
+-                    _caps_set(priv, NM_SUPPL_CAP_TYPE_FILS, NM_TERNARY_FALSE);
+-                    _caps_set(priv, NM_SUPPL_CAP_TYPE_SUITEB192, NM_TERNARY_FALSE);
+-                    _caps_set(priv, NM_SUPPL_CAP_TYPE_WEP, NM_TERNARY_TRUE);
++                    _caps_set(inst, NM_SUPPL_CAP_TYPE_AP, NM_TERNARY_FALSE);
++                    _caps_set(inst, NM_SUPPL_CAP_TYPE_PMF, NM_TERNARY_FALSE);
++                    _caps_set(inst, NM_SUPPL_CAP_TYPE_FILS, NM_TERNARY_FALSE);
++                    _caps_set(inst, NM_SUPPL_CAP_TYPE_SUITEB192, NM_TERNARY_FALSE);
++                    _caps_set(inst, NM_SUPPL_CAP_TYPE_WEP, NM_TERNARY_TRUE);
+                     if (array) {
+                         for (a = array; *a; a++) {
+                             if (nm_streq(*a, "ap")) {
+-                                _caps_set(priv, NM_SUPPL_CAP_TYPE_AP, NM_TERNARY_TRUE);
++                                _caps_set(inst, NM_SUPPL_CAP_TYPE_AP, NM_TERNARY_TRUE);
+                                 continue;
+                             }
+                             if (nm_streq(*a, "pmf")) {
+-                                _caps_set(priv, NM_SUPPL_CAP_TYPE_PMF, NM_TERNARY_TRUE);
++                                _caps_set(inst, NM_SUPPL_CAP_TYPE_PMF, NM_TERNARY_TRUE);
+                                 continue;
+                             }
+                             if (nm_streq(*a, "fils")) {
+-                                _caps_set(priv, NM_SUPPL_CAP_TYPE_FILS, NM_TERNARY_TRUE);
++                                _caps_set(inst, NM_SUPPL_CAP_TYPE_FILS, NM_TERNARY_TRUE);
+                                 continue;
+                             }
+                             if (nm_streq(*a, "p2p")) {
+-                                _caps_set(priv, NM_SUPPL_CAP_TYPE_P2P, NM_TERNARY_TRUE);
++                                _caps_set(inst, NM_SUPPL_CAP_TYPE_P2P, NM_TERNARY_TRUE);
+                                 continue;
+                             }
+                             if (nm_streq(*a, "ft")) {
+-                                _caps_set(priv, NM_SUPPL_CAP_TYPE_FT, NM_TERNARY_TRUE);
++                                _caps_set(inst, NM_SUPPL_CAP_TYPE_FT, NM_TERNARY_TRUE);
+                                 continue;
+                             }
+                             if (nm_streq(*a, "sha384")) {
+-                                _caps_set(priv, NM_SUPPL_CAP_TYPE_SHA384, NM_TERNARY_TRUE);
++                                _caps_set(inst, NM_SUPPL_CAP_TYPE_SHA384, NM_TERNARY_TRUE);
+                                 continue;
+                             }
+                             if (nm_streq(*a, "mesh")) {
+-                                _caps_set(priv, NM_SUPPL_CAP_TYPE_MESH, NM_TERNARY_TRUE);
++                                _caps_set(inst, NM_SUPPL_CAP_TYPE_MESH, NM_TERNARY_TRUE);
+                                 continue;
+                             }
+                             if (nm_streq(*a, "suiteb192")) {
+-                                _caps_set(priv, NM_SUPPL_CAP_TYPE_SUITEB192, NM_TERNARY_TRUE);
++                                _caps_set(inst, NM_SUPPL_CAP_TYPE_SUITEB192, NM_TERNARY_TRUE);
+                                 continue;
+                             }
+                             if (nm_streq(*a, "wep_disabled")) {
+-                                _caps_set(priv, NM_SUPPL_CAP_TYPE_WEP, NM_TERNARY_FALSE);
++                                _caps_set(inst, NM_SUPPL_CAP_TYPE_WEP, NM_TERNARY_FALSE);
+                                 continue;
+                             }
+                         }
+@@ -973,7 +1074,7 @@ _dbus_get_capabilities_cb(GVariant *res, GError *error, gpointer user_data)
+                     if (array) {
+                         for (a = array; *a; a++) {
+                             if (g_ascii_strcasecmp(*a, "FAST") == 0) {
+-                                _caps_set(priv, NM_SUPPL_CAP_TYPE_FAST, NM_TERNARY_TRUE);
++                                _caps_set(inst, NM_SUPPL_CAP_TYPE_FAST, NM_TERNARY_TRUE);
+                                 break;
+                             }
+                         }
+@@ -982,13 +1083,13 @@ _dbus_get_capabilities_cb(GVariant *res, GError *error, gpointer user_data)
+                 continue;
+             }
+             if (nm_streq(res_key, "WFDIEs")) {
+-                _caps_set(priv, NM_SUPPL_CAP_TYPE_WFD, NM_TERNARY_TRUE);
++                _caps_set(inst, NM_SUPPL_CAP_TYPE_WFD, NM_TERNARY_TRUE);
+                 continue;
+             }
+         }
+     }
+ 
+-    _LOGD("supported features:"
++    _LOGD("%s supported features:"
+           " AP%c"
+           " PMF%c"
+           " FILS%c"
+@@ -1001,22 +1102,20 @@ _dbus_get_capabilities_cb(GVariant *res, GError *error, gpointer user_data)
+           " SUITEB192%c"
+           " WEP%c"
+           "",
+-          NM_SUPPL_CAP_TO_CHAR(priv->capabilities, NM_SUPPL_CAP_TYPE_AP),
+-          NM_SUPPL_CAP_TO_CHAR(priv->capabilities, NM_SUPPL_CAP_TYPE_PMF),
+-          NM_SUPPL_CAP_TO_CHAR(priv->capabilities, NM_SUPPL_CAP_TYPE_FILS),
+-          NM_SUPPL_CAP_TO_CHAR(priv->capabilities, NM_SUPPL_CAP_TYPE_P2P),
+-          NM_SUPPL_CAP_TO_CHAR(priv->capabilities, NM_SUPPL_CAP_TYPE_FT),
+-          NM_SUPPL_CAP_TO_CHAR(priv->capabilities, NM_SUPPL_CAP_TYPE_SHA384),
+-          NM_SUPPL_CAP_TO_CHAR(priv->capabilities, NM_SUPPL_CAP_TYPE_MESH),
+-          NM_SUPPL_CAP_TO_CHAR(priv->capabilities, NM_SUPPL_CAP_TYPE_FAST),
+-          NM_SUPPL_CAP_TO_CHAR(priv->capabilities, NM_SUPPL_CAP_TYPE_WFD),
+-          NM_SUPPL_CAP_TO_CHAR(priv->capabilities, NM_SUPPL_CAP_TYPE_SUITEB192),
+-          NM_SUPPL_CAP_TO_CHAR(priv->capabilities, NM_SUPPL_CAP_TYPE_WEP));
+-
+-    nm_assert(g_hash_table_size(priv->supp_ifaces) == 0);
+-    nm_assert(c_list_is_empty(&priv->supp_lst_head));
+-
+-    _create_iface_proceed_all(self, NULL);
++          inst->service,
++          NM_SUPPL_CAP_TO_CHAR(inst->capabilities, NM_SUPPL_CAP_TYPE_AP),
++          NM_SUPPL_CAP_TO_CHAR(inst->capabilities, NM_SUPPL_CAP_TYPE_PMF),
++          NM_SUPPL_CAP_TO_CHAR(inst->capabilities, NM_SUPPL_CAP_TYPE_FILS),
++          NM_SUPPL_CAP_TO_CHAR(inst->capabilities, NM_SUPPL_CAP_TYPE_P2P),
++          NM_SUPPL_CAP_TO_CHAR(inst->capabilities, NM_SUPPL_CAP_TYPE_FT),
++          NM_SUPPL_CAP_TO_CHAR(inst->capabilities, NM_SUPPL_CAP_TYPE_SHA384),
++          NM_SUPPL_CAP_TO_CHAR(inst->capabilities, NM_SUPPL_CAP_TYPE_MESH),
++          NM_SUPPL_CAP_TO_CHAR(inst->capabilities, NM_SUPPL_CAP_TYPE_FAST),
++          NM_SUPPL_CAP_TO_CHAR(inst->capabilities, NM_SUPPL_CAP_TYPE_WFD),
++          NM_SUPPL_CAP_TO_CHAR(inst->capabilities, NM_SUPPL_CAP_TYPE_SUITEB192),
++          NM_SUPPL_CAP_TO_CHAR(inst->capabilities, NM_SUPPL_CAP_TYPE_WEP));
++
++    _create_iface_proceed_all(self, inst, NULL);
+ }
+ 
+ /*****************************************************************************/
+@@ -1072,14 +1171,31 @@ _supp_iface_remove_one(NMSupplicantManager   *self,
+ 
+ static void
+ _supp_iface_remove_all(NMSupplicantManager *self,
++                       SupplInst           *inst,
+                        gboolean             force_remove_from_supplicant,
+                        const char          *reason)
+ {
+     NMSupplicantManagerPrivate *priv = NM_SUPPLICANT_MANAGER_GET_PRIVATE(self);
+     NMSupplicantInterface      *supp_iface;
+-
+-    while ((supp_iface = c_list_first_entry(&priv->supp_lst_head, NMSupplicantInterface, supp_lst)))
+-        _supp_iface_remove_one(self, supp_iface, force_remove_from_supplicant, reason);
++    gboolean                    found;
++
++    /* With @inst, only the interfaces that belong to that supplicant are
++     * removed. @inst NULL removes all of them. */
++    do {
++        found = FALSE;
++        c_list_for_each_entry (supp_iface, &priv->supp_lst_head, supp_lst) {
++            if (inst
++                && nm_supplicant_path_is_s1g(
++                       nm_supplicant_interface_get_object_path(supp_iface)->str)
++                       != inst->is_s1g)
++                continue;
++            /* removing an interface can run arbitrary callbacks, which may
++             * change the list. Restart after removal. */
++            _supp_iface_remove_one(self, supp_iface, force_remove_from_supplicant, reason);
++            found = TRUE;
++            break;
++        }
++    } while (found);
+ }
+ 
+ /*****************************************************************************/
+@@ -1087,74 +1203,76 @@ _supp_iface_remove_all(NMSupplicantManager *self,
+ static gboolean
+ _available_reset_cb(gpointer user_data)
+ {
+-    NMSupplicantManager        *self = user_data;
+-    NMSupplicantManagerPrivate *priv = NM_SUPPLICANT_MANAGER_GET_PRIVATE(self);
++    SupplInst *inst = user_data;
+ 
+-    priv->available_reset_id = 0;
+-    nm_assert(priv->available == NM_TERNARY_FALSE);
+-    priv->available = NM_TERNARY_DEFAULT;
+-    g_signal_emit(self, signals[AVAILABLE_CHANGED], 0);
++    inst->available_reset_id = 0;
++    nm_assert(inst->available == NM_TERNARY_FALSE);
++    inst->available = NM_TERNARY_DEFAULT;
++    g_signal_emit(inst->self, signals[AVAILABLE_CHANGED], 0);
+     return G_SOURCE_REMOVE;
+ }
+ 
+ /*****************************************************************************/
+ 
+ static void
+-name_owner_changed(NMSupplicantManager *self, const char *name_owner, gboolean first_time)
++name_owner_changed(SupplInst *inst, const char *name_owner, gboolean first_time)
+ {
++    NMSupplicantManager        *self = inst->self;
+     NMSupplicantManagerPrivate *priv = NM_SUPPLICANT_MANAGER_GET_PRIVATE(self);
+     NMTernary                   available;
+     gboolean                    available_changed = FALSE;
+ 
+-    nm_assert(!priv->get_name_owner_cancellable);
++    nm_assert(!inst->get_name_owner_cancellable);
+     nm_assert(!name_owner || name_owner[0]);
+-    nm_assert((first_time && !priv->name_owner)
+-              || (!first_time && (!!priv->name_owner) != (!!name_owner)));
++    nm_assert((first_time && !inst->name_owner)
++              || (!first_time && (!!inst->name_owner) != (!!name_owner)));
+ 
+     if (first_time) {
+-        _LOGD("wpa_supplicant name owner %s%s%s (%srunning)",
++        _LOGD("%s name owner %s%s%s (%srunning)",
++              inst->service,
+               NM_PRINT_FMT_QUOTE_STRING(name_owner),
+               name_owner ? "" : "not ");
+     } else {
+-        _LOGD("wpa_supplicant name owner \"%s\" %s (%srunning)",
+-              name_owner ?: priv->name_owner->str,
+-              name_owner ? "disappeared" : "appeared",
++        _LOGD("%s name owner \"%s\" %s (%srunning)",
++              inst->service,
++              name_owner ?: inst->name_owner->str,
++              name_owner ? "appeared" : "disappeared",
+               name_owner ? "" : "not ");
+     }
+ 
+-    nm_ref_string_unref(priv->name_owner);
+-    priv->name_owner = nm_ref_string_new(name_owner);
++    nm_ref_string_unref(inst->name_owner);
++    inst->name_owner = nm_ref_string_new(name_owner);
+ 
+-    nm_clear_g_dbus_connection_signal(priv->dbus_connection, &priv->interface_removed_id);
++    nm_clear_g_dbus_connection_signal(priv->dbus_connection, &inst->interface_removed_id);
+ 
+     if (name_owner) {
+-        if (nm_clear_g_source(&priv->poke_name_owner_timeout_id))
+-            _LOGT("poke service \"%s\" completed with name owner change", NM_WPAS_DBUS_SERVICE);
+-        nm_clear_g_cancellable(&priv->poke_name_owner_cancellable);
++        if (nm_clear_g_source(&inst->poke_name_owner_timeout_id))
++            _LOGT("poke service \"%s\" completed with name owner change", inst->service);
++        nm_clear_g_cancellable(&inst->poke_name_owner_cancellable);
+     }
+ 
+-    nm_clear_g_cancellable(&priv->get_capabilities_cancellable);
++    nm_clear_g_cancellable(&inst->get_capabilities_cancellable);
+ 
+-    priv->capabilities = NM_SUPPL_CAP_MASK_NONE;
+-    if (priv->name_owner) {
+-        priv->get_capabilities_cancellable = g_cancellable_new();
++    inst->capabilities = NM_SUPPL_CAP_MASK_NONE;
++    if (inst->name_owner) {
++        inst->get_capabilities_cancellable = g_cancellable_new();
+         nm_dbus_connection_call_get_all(priv->dbus_connection,
+-                                        priv->name_owner->str,
+-                                        NM_WPAS_DBUS_PATH,
+-                                        NM_WPAS_DBUS_INTERFACE,
++                                        inst->name_owner->str,
++                                        inst->path,
++                                        inst->interface,
+                                         5000,
+-                                        priv->get_capabilities_cancellable,
++                                        inst->get_capabilities_cancellable,
+                                         _dbus_get_capabilities_cb,
+-                                        self);
+-        priv->interface_removed_id = g_dbus_connection_signal_subscribe(priv->dbus_connection,
+-                                                                        priv->name_owner->str,
+-                                                                        NM_WPAS_DBUS_INTERFACE,
++                                        inst);
++        inst->interface_removed_id = g_dbus_connection_signal_subscribe(priv->dbus_connection,
++                                                                        inst->name_owner->str,
++                                                                        inst->interface,
+                                                                         "InterfaceRemoved",
+                                                                         NULL,
+                                                                         NULL,
+                                                                         G_DBUS_SIGNAL_FLAGS_NONE,
+                                                                         _dbus_interface_removed_cb,
+-                                                                        self,
++                                                                        inst,
+                                                                         NULL);
+     }
+ 
+@@ -1169,30 +1287,32 @@ name_owner_changed(NMSupplicantManager *self, const char *name_owner, gboolean f
+      * Actually, below we reset the hard block after a short timeout. This
+      * causes the caller to notify that supplicant may now by around and
+      * retry to D-Bus activate it. */
+-    if (priv->name_owner)
++    if (inst->name_owner)
+         available = NM_TERNARY_TRUE;
+     else if (first_time)
+         available = NM_TERNARY_DEFAULT;
+     else
+         available = NM_TERNARY_FALSE;
+ 
+-    if (priv->available != available) {
+-        priv->available = available;
+-        _LOGD("supplicant is now %savailable",
++    if (inst->available != available) {
++        inst->available = available;
++        _LOGD("%s is now %savailable",
++              inst->service,
+               available == FALSE ? "not " : (available == TRUE ? "" : "maybe "));
+         available_changed = TRUE;
+ 
+-        nm_clear_g_source(&priv->available_reset_id);
++        nm_clear_g_source(&inst->available_reset_id);
+         if (available == NM_TERNARY_FALSE) {
+             /* reset the availability from a hard "no" to a "maybe" in a bit. */
+-            priv->available_reset_id = g_timeout_add_seconds(60, _available_reset_cb, self);
++            inst->available_reset_id = g_timeout_add_seconds(60, _available_reset_cb, inst);
+         }
+     }
+ 
+-    _supp_iface_remove_all(self, TRUE, "name-owner changed");
++    /* Only the interfaces of this supplicant go away with it. */
++    _supp_iface_remove_all(self, inst, TRUE, "name-owner changed");
+ 
+-    if (!priv->name_owner) {
+-        if (priv->poke_name_owner_timeout_id) {
++    if (!inst->name_owner) {
++        if (inst->poke_name_owner_timeout_id) {
+             /* we are still poking for the service to start. Don't cancel
+              * the pending create requests just yet. */
+         } else {
+@@ -1200,7 +1320,7 @@ name_owner_changed(NMSupplicantManager *self, const char *name_owner, gboolean f
+ 
+             /* When we loose the name owner, we fail all pending creation requests. */
+             nm_utils_error_set(&local_error, NM_UTILS_ERROR_UNKNOWN, "Name owner lost");
+-            _create_iface_proceed_all(self, local_error);
++            _create_iface_proceed_all(self, inst, local_error);
+         }
+     } else {
+         /* We got a name-owner, but we don't do anything. Instead let
+@@ -1225,46 +1345,42 @@ name_owner_changed_cb(GDBusConnection *connection,
+                       GVariant        *parameters,
+                       gpointer         user_data)
+ {
+-    gs_unref_object NMSupplicantManager *self = g_object_ref(user_data);
+-    NMSupplicantManagerPrivate          *priv = NM_SUPPLICANT_MANAGER_GET_PRIVATE(self);
++    SupplInst                           *inst = user_data;
++    gs_unref_object NMSupplicantManager *self = g_object_ref(inst->self);
+     const char                          *name_owner;
+ 
+     if (!g_variant_is_of_type(parameters, G_VARIANT_TYPE("(sss)")))
+         return;
+ 
+-    if (priv->get_name_owner_cancellable)
++    if (inst->get_name_owner_cancellable)
+         return;
+ 
+     g_variant_get(parameters, "(&s&s&s)", NULL, NULL, &name_owner);
+ 
+     name_owner = nm_str_not_empty(name_owner);
+ 
+-    if (nm_streq0(name_owner, nm_ref_string_get_str(priv->name_owner)))
++    if (nm_streq0(name_owner, nm_ref_string_get_str(inst->name_owner)))
+         return;
+ 
+-    if (name_owner && priv->name_owner) {
++    if (name_owner && inst->name_owner) {
+         /* odd, we directly switch from one name owner to the next. Can't allow that.
+          * First clear the name owner before resetting. */
+-        name_owner_changed(self, NULL, FALSE);
++        name_owner_changed(inst, NULL, FALSE);
+     }
+-    name_owner_changed(user_data, name_owner, FALSE);
++    name_owner_changed(inst, name_owner, FALSE);
+ }
+ 
+ static void
+ get_name_owner_cb(const char *name_owner, GError *error, gpointer user_data)
+ {
+-    NMSupplicantManager        *self = user_data;
+-    NMSupplicantManagerPrivate *priv = NM_SUPPLICANT_MANAGER_GET_PRIVATE(self);
++    SupplInst *inst = user_data;
+ 
+     if (!name_owner && nm_utils_error_is_cancelled(error))
+         return;
+ 
+-    self = user_data;
+-    priv = NM_SUPPLICANT_MANAGER_GET_PRIVATE(self);
+-
+-    g_clear_object(&priv->get_name_owner_cancellable);
++    g_clear_object(&inst->get_name_owner_cancellable);
+ 
+-    name_owner_changed(self, nm_str_not_empty(name_owner), TRUE);
++    name_owner_changed(inst, nm_str_not_empty(name_owner), TRUE);
+ }
+ 
+ /*****************************************************************************/
+@@ -1273,9 +1389,24 @@ static void
+ nm_supplicant_manager_init(NMSupplicantManager *self)
+ {
+     NMSupplicantManagerPrivate *priv = NM_SUPPLICANT_MANAGER_GET_PRIVATE(self);
++    guint                       i;
+ 
+-    nm_assert(priv->capabilities == NM_SUPPL_CAP_MASK_NONE);
+-    nm_assert(priv->available == NM_TERNARY_FALSE);
++    INST_STOCK(priv)->self      = self;
++    INST_STOCK(priv)->service   = NM_WPAS_DBUS_SERVICE;
++    INST_STOCK(priv)->path      = NM_WPAS_DBUS_PATH;
++    INST_STOCK(priv)->interface = NM_WPAS_DBUS_INTERFACE;
++    INST_STOCK(priv)->is_s1g    = FALSE;
++
++    INST_S1G(priv)->self      = self;
++    INST_S1G(priv)->service   = NM_WPAS_DBUS_SERVICE_S1G;
++    INST_S1G(priv)->path      = NM_WPAS_DBUS_PATH_S1G;
++    INST_S1G(priv)->interface = NM_WPAS_DBUS_INTERFACE_S1G;
++    INST_S1G(priv)->is_s1g    = TRUE;
++
++    nm_assert(INST_STOCK(priv)->capabilities == NM_SUPPL_CAP_MASK_NONE);
++    nm_assert(INST_STOCK(priv)->available == NM_TERNARY_FALSE);
++    nm_assert(INST_S1G(priv)->capabilities == NM_SUPPL_CAP_MASK_NONE);
++    nm_assert(INST_S1G(priv)->available == NM_TERNARY_FALSE);
+ 
+     priv->supp_ifaces = g_hash_table_new(nm_direct_hash, NULL);
+     c_list_init(&priv->supp_lst_head);
+@@ -1288,19 +1419,23 @@ nm_supplicant_manager_init(NMSupplicantManager *self)
+         return;
+     }
+ 
+-    priv->name_owner_changed_id =
+-        nm_dbus_connection_signal_subscribe_name_owner_changed(priv->dbus_connection,
+-                                                               NM_WPAS_DBUS_SERVICE,
+-                                                               name_owner_changed_cb,
+-                                                               self,
+-                                                               NULL);
+-    priv->get_name_owner_cancellable = g_cancellable_new();
+-    nm_dbus_connection_call_get_name_owner(priv->dbus_connection,
+-                                           NM_WPAS_DBUS_SERVICE,
+-                                           -1,
+-                                           priv->get_name_owner_cancellable,
+-                                           get_name_owner_cb,
+-                                           self);
++    for (i = 0; i < G_N_ELEMENTS(priv->inst); i++) {
++        SupplInst *inst = &priv->inst[i];
++
++        inst->name_owner_changed_id =
++            nm_dbus_connection_signal_subscribe_name_owner_changed(priv->dbus_connection,
++                                                                   inst->service,
++                                                                   name_owner_changed_cb,
++                                                                   inst,
++                                                                   NULL);
++        inst->get_name_owner_cancellable = g_cancellable_new();
++        nm_dbus_connection_call_get_name_owner(priv->dbus_connection,
++                                               inst->service,
++                                               -1,
++                                               inst->get_name_owner_cancellable,
++                                               get_name_owner_cb,
++                                               inst);
++    }
+ }
+ 
+ static void
+@@ -1308,24 +1443,29 @@ dispose(GObject *object)
+ {
+     NMSupplicantManager        *self = (NMSupplicantManager *) object;
+     NMSupplicantManagerPrivate *priv = NM_SUPPLICANT_MANAGER_GET_PRIVATE(self);
++    guint                       i;
+ 
+-    _supp_iface_remove_all(self, TRUE, "NMSupplicantManager is disposing");
++    _supp_iface_remove_all(self, NULL, TRUE, "NMSupplicantManager is disposing");
+ 
+     nm_assert(c_list_is_empty(&priv->create_iface_lst_head));
+ 
+-    nm_clear_g_source(&priv->available_reset_id);
++    for (i = 0; i < G_N_ELEMENTS(priv->inst); i++) {
++        SupplInst *inst = &priv->inst[i];
+ 
+-    priv->available = NM_TERNARY_FALSE;
+-    nm_clear_pointer(&priv->name_owner, nm_ref_string_unref);
++        nm_clear_g_source(&inst->available_reset_id);
+ 
+-    nm_clear_g_source(&priv->poke_name_owner_timeout_id);
+-    nm_clear_g_cancellable(&priv->poke_name_owner_cancellable);
++        inst->available = NM_TERNARY_FALSE;
++        nm_clear_pointer(&inst->name_owner, nm_ref_string_unref);
+ 
+-    nm_clear_g_dbus_connection_signal(priv->dbus_connection, &priv->interface_removed_id);
+-    nm_clear_g_dbus_connection_signal(priv->dbus_connection, &priv->name_owner_changed_id);
++        nm_clear_g_source(&inst->poke_name_owner_timeout_id);
++        nm_clear_g_cancellable(&inst->poke_name_owner_cancellable);
+ 
+-    nm_clear_g_cancellable(&priv->get_name_owner_cancellable);
+-    nm_clear_g_cancellable(&priv->get_capabilities_cancellable);
++        nm_clear_g_dbus_connection_signal(priv->dbus_connection, &inst->interface_removed_id);
++        nm_clear_g_dbus_connection_signal(priv->dbus_connection, &inst->name_owner_changed_id);
++
++        nm_clear_g_cancellable(&inst->get_name_owner_cancellable);
++        nm_clear_g_cancellable(&inst->get_capabilities_cancellable);
++    }
+ 
+     G_OBJECT_CLASS(nm_supplicant_manager_parent_class)->dispose(object);
+ 
+diff --git a/src/core/supplicant/nm-supplicant-manager.h b/src/core/supplicant/nm-supplicant-manager.h
+index b3284b70..e08f1640 100644
+--- a/src/core/supplicant/nm-supplicant-manager.h
++++ b/src/core/supplicant/nm-supplicant-manager.h
+@@ -33,8 +33,10 @@ NMSupplicantManager *nm_supplicant_manager_get(void);
+ NMTernary nm_supplicant_manager_is_available(NMSupplicantManager *self);
+ 
+ GDBusConnection *nm_supplicant_manager_get_dbus_connection(NMSupplicantManager *self);
+-NMRefString     *nm_supplicant_manager_get_dbus_name_owner(NMSupplicantManager *self);
+-NMSupplCapMask   nm_supplicant_manager_get_global_capabilities(NMSupplicantManager *self);
++NMRefString *nm_supplicant_manager_get_dbus_name_owner(NMSupplicantManager *self,
++                                                        const char          *object_path);
++NMSupplCapMask nm_supplicant_manager_get_global_capabilities(NMSupplicantManager *self,
++                                                             const char          *object_path);
+ 
+ void nm_supplicant_manager_set_wfd_ies(NMSupplicantManager *self, GBytes *wfd_ies);
+ 
+diff --git a/src/core/supplicant/nm-supplicant-types.h b/src/core/supplicant/nm-supplicant-types.h
+index 870a53c3..b2b1cb8e 100644
+--- a/src/core/supplicant/nm-supplicant-types.h
++++ b/src/core/supplicant/nm-supplicant-types.h
+@@ -9,9 +9,19 @@
+ #include "c-list/src/c-list.h"
+ #include "libnm-base/nm-base.h"
+ 
+-#define NM_WPAS_DBUS_SERVICE   "fi.w1.wpa_supplicant1"
++#define NM_WPAS_DBUS_SERVICE    "fi.w1.wpa_supplicant1"
+ #define NM_WPAS_DBUS_PATH      "/fi/w1/wpa_supplicant1"
+-#define NM_WPAS_DBUS_INTERFACE "fi.w1.wpa_supplicant1"
++#define NM_WPAS_DBUS_INTERFACE  "fi.w1.wpa_supplicant1"
++
++#define NM_WPAS_DBUS_SERVICE_S1G   "fi.w1.wpa_supplicant1_s1g"
++#define NM_WPAS_DBUS_PATH_S1G     "/fi/w1/wpa_supplicant1_s1g"
++#define NM_WPAS_DBUS_INTERFACE_S1G "fi.w1.wpa_supplicant1_s1g"
++
++static inline gboolean
++nm_supplicant_path_is_s1g(const char *path)
++{
++    return path && g_str_has_prefix(path, NM_WPAS_DBUS_PATH_S1G "/");
++}
+ 
+ #if HAVE_WEXT
+ #define NM_WPAS_DEFAULT_WIFI_DRIVER "nl80211,wext"
+@@ -30,6 +40,17 @@
+ #define NM_WPAS_ERROR_EXISTS_ERROR              NM_WPAS_DBUS_INTERFACE ".InterfaceExists"
+ #define NM_WPAS_ERROR_UNKNOWN_IFACE             NM_WPAS_DBUS_INTERFACE ".InterfaceUnknown"
+ 
++#define NM_WPAS_DBUS_IFACE_INTERFACE_S1G            NM_WPAS_DBUS_INTERFACE_S1G ".Interface"
++#define NM_WPAS_DBUS_IFACE_INTERFACE_WPS_S1G        NM_WPAS_DBUS_INTERFACE_S1G ".Interface.WPS"
++#define NM_WPAS_DBUS_IFACE_INTERFACE_P2P_DEVICE_S1G NM_WPAS_DBUS_INTERFACE_S1G ".Interface.P2PDevice"
++#define NM_WPAS_DBUS_IFACE_BSS_S1G                  NM_WPAS_DBUS_INTERFACE_S1G ".BSS"
++#define NM_WPAS_DBUS_IFACE_PEER_S1G                 NM_WPAS_DBUS_INTERFACE_S1G ".Peer"
++#define NM_WPAS_DBUS_IFACE_GROUP_S1G                NM_WPAS_DBUS_INTERFACE_S1G ".Group"
++#define NM_WPAS_DBUS_IFACE_NETWORK_S1G              NM_WPAS_DBUS_INTERFACE_S1G ".Network"
++#define NM_WPAS_ERROR_INVALID_IFACE_S1G             NM_WPAS_DBUS_INTERFACE_S1G ".InvalidInterface"
++#define NM_WPAS_ERROR_EXISTS_ERROR_S1G              NM_WPAS_DBUS_INTERFACE_S1G ".InterfaceExists"
++#define NM_WPAS_ERROR_UNKNOWN_IFACE_S1G             NM_WPAS_DBUS_INTERFACE_S1G ".InterfaceUnknown"
++
+ typedef struct _NMSupplicantManager   NMSupplicantManager;
+ typedef struct _NMSupplicantInterface NMSupplicantInterface;
+ typedef struct _NMSupplicantConfig    NMSupplicantConfig;
+-- 
+2.43.0
+
